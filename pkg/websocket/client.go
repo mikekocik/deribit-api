@@ -248,6 +248,7 @@ func (c *Client) Stop() {
 
 func (c *Client) heartbeat() {
 	logger := c.l.With("func", "heartbeat")
+	logger.Info("starting heartbeat check...")
 	t := time.NewTicker(5 * time.Second)
 	for {
 		select {
@@ -257,7 +258,7 @@ func (c *Client) heartbeat() {
 				_ = c.rpcConn.Close() // close server
 			}
 		case <-c.heartCancel:
-			logger.Debug("cancel heartbeat check")
+			logger.Info("cancel heartbeat check")
 			return
 		}
 	}
