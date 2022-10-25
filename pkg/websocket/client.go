@@ -81,9 +81,9 @@ type Client struct {
 	newRPCConn  RPCConnector
 	rpcConn     JSONRPC2
 	mu          sync.RWMutex
-	once        sync.Once
 	heartCancel chan struct{}
 	isConnected bool
+	restartCh   chan struct{}
 	stopC       chan struct{}
 
 	subscriptions    []string
@@ -106,7 +106,6 @@ func New(l *zap.SugaredLogger, cfg *Configuration) *Client {
 		debugMode:        cfg.DebugMode,
 		newRPCConn:       cfg.NewRPCConn,
 		mu:               sync.RWMutex{},
-		once:             sync.Once{},
 		subscriptionsMap: make(map[string]struct{}),
 		emitter:          emission.NewEmitter(),
 	}
@@ -134,6 +133,7 @@ func (c *Client) Start() error {
 	c.subscriptionsMap = make(map[string]struct{})
 	c.rpcConn = nil
 	c.heartCancel = make(chan struct{})
+	c.restartCh = make(chan struct{})
 
 	rpcConn, err := c.newRPCConn(context.Background(), c.addr, c)
 	if err != nil {
@@ -166,13 +166,10 @@ func (c *Client) Start() error {
 
 	go c.heartbeat()
 
-	c.once.Do(func() {
-		if c.autoReconnect {
-			c.l.With("func", "start").Infow("auto reconnect is enable")
-			c.stopC = make(chan struct{})
-			go c.reconnect()
-		}
-	})
+	if c.autoReconnect {
+		c.stopC = make(chan struct{})
+		go c.reconnect()
+	}
 
 	return nil
 }
@@ -197,12 +194,8 @@ func (c *Client) Call(ctx context.Context, method string, params interface{}, re
 	// or `jsonrpc2: connection is closed`
 	if err != nil && (errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) ||
 		errors.Is(err, jsonrpc2.ErrClosed)) {
-		c.l.Error("failed to call to rpcConn", "err", err)
-		if err := c.rpcConn.Close(); err != nil {
-			c.l.Warnw("failed to close connection", "err", err)
-			// force to restart connection
-			c.RestartConnection()
-		}
+		c.l.Errorw("failed to call to rpcConn", "err", err)
+		c.RestartConnection()
 	}
 
 	return err
@@ -230,19 +223,15 @@ func (c *Client) ResetConnection() {
 func (c *Client) Stop() {
 	logger := c.l.With("func", "Stop")
 	if c.autoReconnect {
-		close(c.stopC)
+		c.tryCloseCh(c.stopC, "stopCh")
 		time.Sleep(time.Second)
 	}
 	c.setIsConnected(false)
-
-	if !isClosed(c.heartCancel) {
-		close(c.heartCancel)
-	}
+	c.tryCloseCh(c.heartCancel, "heartCancelCh")
 
 	if err := c.rpcConn.Close(); err != nil {
 		logger.Warnw("error close ws connection", "err", err)
 	}
-	c.once = sync.Once{}
 	c.subscriptions = nil
 }
 
@@ -255,7 +244,6 @@ func (c *Client) heartbeat() {
 		case <-t.C:
 			if _, err := c.Test(context.Background()); err != nil {
 				logger.Errorw("error test server", "err", err)
-				_ = c.rpcConn.Close() // close server
 			}
 		case <-c.heartCancel:
 			logger.Info("cancel heartbeat check")
@@ -273,18 +261,24 @@ func (c *Client) reconnect() {
 			return
 		case <-c.rpcConn.DisconnectNotify():
 			c.RestartConnection()
+		case <-c.restartCh:
+			c.restartConnection()
+			return
 		}
 	}
 }
 
 func (c *Client) RestartConnection() {
+	c.tryCloseCh(c.restartCh, "restartCh")
+}
+
+func (c *Client) restartConnection() {
 	logger := c.l.With("func", "RestartConnection")
+	c.ResetConnection()
 	c.setIsConnected(false)
 	logger.Infow("disconnect, reconnect...")
 
-	if !isClosed(c.heartCancel) {
-		close(c.heartCancel)
-	}
+	c.tryCloseCh(c.heartCancel, "heartCancelCh")
 
 	time.Sleep(1 * time.Second)
 	for {
@@ -302,12 +296,12 @@ func (c *Client) RestartConnection() {
 	}
 }
 
-func isClosed(ch <-chan struct{}) bool {
-	select {
-	case <-ch:
-		return true
-	default:
-	}
+func (c *Client) tryCloseCh(ch chan struct{}, name string) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.l.Infow("Failed to close channel", "info", r, "name", name)
+		}
+	}()
 
-	return false
+	close(ch)
 }
