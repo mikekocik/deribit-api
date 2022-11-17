@@ -20,6 +20,7 @@ var (
 	ErrDuplicatedPackage     = errors.New("duplicated package")
 	ErrInvalidIpv4Address    = errors.New("invalid ipv4 address")
 	ErrOutOfOrder            = errors.New("package out of order")
+	ErrEventWithoutIsLast    = errors.New("decoded event without isLast")
 )
 
 func newInstrumentNotificationChannel(kind, currency string) string {
