@@ -52,7 +52,7 @@ type Client struct {
 	log               *zap.SugaredLogger
 	inf               *net.Interface
 	addrs             []string
-	conns             []*ipv4.PacketConn
+	connMap           map[int]*ipv4.PacketConn // port: packetConnection
 	instrumentsGetter InstrumentsGetter
 
 	supportCurrencies []string
@@ -501,11 +501,11 @@ func (c *Client) restartConnections(ctx context.Context) error {
 
 // Stop stops listening for events.
 func (c *Client) Stop() error {
-	for _, conn := range c.conns {
+	for _, conn := range c.connMap {
 		conn.Close()
 	}
 
-	c.conns = nil
+	c.connMap = nil
 
 	return nil
 }
@@ -636,12 +636,11 @@ func (c *Client) setupConnection(port int, ips []string) ([]net.IP, error) {
 		return nil, err
 	}
 
-	idx := len(c.conns)
-	c.conns = append(c.conns, ipv4.NewPacketConn(conn))
+	c.connMap[port] = ipv4.NewPacketConn(conn)
 
 	ipGroups := make([]net.IP, len(ips))
 
-	err = c.conns[idx].SetControlMessage(ipv4.FlagDst, true)
+	err = c.connMap[port].SetControlMessage(ipv4.FlagDst, true)
 	if err != nil {
 		c.log.Errorw("Failed to set control message", "err", err)
 		return nil, err
@@ -652,7 +651,7 @@ func (c *Client) setupConnection(port int, ips []string) ([]net.IP, error) {
 		if group == nil {
 			return nil, ErrInvalidIpv4Address
 		}
-		err := c.conns[idx].JoinGroup(c.inf, &net.UDPAddr{IP: group})
+		err := c.connMap[port].JoinGroup(c.inf, &net.UDPAddr{IP: group})
 		if err != nil {
 			c.log.Errorw("failed to join group", "group", group, "err", err, "ip", ip)
 			return nil, err
@@ -677,7 +676,9 @@ func splitAddr(addr string) (string, int, error) {
 	return parts[0], port, nil
 }
 
-func (c *Client) setupConnections() ([]net.IP, error) {
+func (c *Client) setupConnections() (map[int][]net.IP, error) {
+	c.connMap = make(map[int]*ipv4.PacketConn)
+
 	portIPsMap := make(map[int][]string)
 	for _, addr := range c.addrs {
 		ip, port, err := splitAddr(addr)
@@ -691,7 +692,7 @@ func (c *Client) setupConnections() ([]net.IP, error) {
 		portIPsMap[port] = ips
 	}
 
-	var ipAddrs []net.IP
+	portNetIPsMap := make(map[int][]net.IP)
 	for port, ips := range portIPsMap {
 		newIPs, err := c.setupConnection(port, ips)
 		if err != nil {
@@ -699,16 +700,16 @@ func (c *Client) setupConnections() ([]net.IP, error) {
 			return nil, err
 		}
 
-		ipAddrs = append(ipAddrs, newIPs...)
+		portNetIPsMap[port] = newIPs
 	}
 
-	return ipAddrs, nil
+	return portNetIPsMap, nil
 }
 
 // ListenToEvents listens to a list of udp addresses on given network interface.
 // nolint:cyclop,gocognit
 func (c *Client) ListenToEvents(ctx context.Context) error {
-	ipGroups, err := c.setupConnections()
+	portIPsMap, err := c.setupConnections()
 	if err != nil {
 		c.log.Errorw("failed to setup ipv4 packet connection", "err", err)
 		return err
@@ -741,12 +742,12 @@ func (c *Client) ListenToEvents(ctx context.Context) error {
 	}()
 
 	// listen to event using ipv4 package
-	for _, conn := range c.conns {
-		go func(conn *ipv4.PacketConn) {
+	for port, conn := range c.connMap {
+		go func(conn *ipv4.PacketConn, ips []net.IP) {
 			for {
 				data := pool.Get()
 
-				res, err := readUDPMulticastPackage(conn, ipGroups, data)
+				res, err := readUDPMulticastPackage(conn, ips, data)
 				if res == nil {
 					pool.Put(data)
 				}
@@ -762,7 +763,7 @@ func (c *Client) ListenToEvents(ctx context.Context) error {
 					dataCh <- res
 				}
 			}
-		}(conn)
+		}(conn, portIPsMap[port])
 	}
 
 	return nil
