@@ -1,4 +1,4 @@
-module github.com/KyberNetwork/deribit-api
+module github.com/mikekocik/deribit-api
 
 go 1.17
 
